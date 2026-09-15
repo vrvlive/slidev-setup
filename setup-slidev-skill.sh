@@ -50,6 +50,25 @@ warn() { printf '%s !  %s%s\n' "$YELLOW" "$1" "$RESET"; }
 ok()   { printf '%s ✓  %s%s\n' "$GREEN" "$1" "$RESET"; }
 die()  { printf '%s ✗  %s%s\n' "$RED" "$1" "$RESET" >&2; exit 1; }
 
+# Run a command with a wall-clock limit where the platform provides one.
+# Returns 124 on timeout, matching GNU coreutils.
+TIMEOUT_BIN=""
+if command -v timeout  >/dev/null 2>&1; then TIMEOUT_BIN="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout"
+fi
+
+run_limited() {
+  _limit="$1"; shift
+  if [ -n "$TIMEOUT_BIN" ]; then
+    "$TIMEOUT_BIN" "$_limit" "$@"
+  else
+    "$@"
+  fi
+}
+
+# npm flags that stop a dead proxy from stalling forever
+NPM_NET_FLAGS="--fetch-timeout=120000 --fetch-retries=3 --no-audit --no-fund"
+
 # ------------------------------------------------------------------ args ----
 
 while [ $# -gt 0 ]; do
@@ -336,7 +355,7 @@ if [ -n "$TITLE" ]; then
 fi
 
 echo "Installing dependencies (offline where possible)..."
-( cd "$TARGET" && npm install --prefer-offline --no-audit --no-fund --loglevel=error )
+( cd "$TARGET" && npm install --prefer-offline --no-audit --no-fund --fetch-timeout=120000 --fetch-retries=3 )
 
 echo "Deck ready: $TARGET"
 echo "  preview:  cd $TARGET && npm run dev"
@@ -353,7 +372,7 @@ DECK="${1:-$PWD}"
 cd "$DECK"
 
 [ -f slides.md ] || { echo "No slides.md in $DECK" >&2; exit 1; }
-[ -d node_modules ] || npm install --prefer-offline --no-audit --no-fund --loglevel=error
+[ -d node_modules ] || npm install --prefer-offline --no-audit --no-fund --fetch-timeout=120000 --fetch-retries=3
 
 rm -rf dist/review
 npx --no-install slidev export --format png --output dist/review slides.md
@@ -374,7 +393,7 @@ FORMAT="${2:-pdf}"
 cd "$DECK"
 
 [ -f slides.md ] || { echo "No slides.md in $DECK" >&2; exit 1; }
-[ -d node_modules ] || npm install --prefer-offline --no-audit --no-fund --loglevel=error
+[ -d node_modules ] || npm install --prefer-offline --no-audit --no-fund --fetch-timeout=120000 --fetch-retries=3
 
 mkdir -p dist
 case "$FORMAT" in
@@ -396,7 +415,7 @@ set -euo pipefail
 
 DECK="${1:-$PWD}"
 cd "$DECK"
-[ -d node_modules ] || npm install --prefer-offline --no-audit --no-fund --loglevel=error
+[ -d node_modules ] || npm install --prefer-offline --no-audit --no-fund --fetch-timeout=120000 --fetch-retries=3
 npx --no-install slidev --open slides.md
 PREV_EOF
 
@@ -617,34 +636,69 @@ ok "Skill files written"
 
 # ------------------------------------------------------------------ install ----
 
-step "Installing Slidev toolchain (this downloads packages once)"
+step "Installing Slidev toolchain"
 info "Target: $TEMPLATE_DIR"
+info "This downloads roughly 500 MB: Slidev, its themes, and a headless Chromium"
+info "(pulled in by playwright-chromium's postinstall). Expect 2-8 minutes."
+info "npm output follows so you can see it is making progress."
+[ -z "$TIMEOUT_BIN" ] && warn "No 'timeout' command found; install coreutils for a hard time limit."
+printf '\n'
 
-if ( cd "$TEMPLATE_DIR" && npm install --no-audit --no-fund --loglevel=error ); then
+set +e
+( cd "$TEMPLATE_DIR" && run_limited 1800 npm install $NPM_NET_FLAGS )
+NPM_STATUS=$?
+set -e
+printf '\n'
+
+if [ "$NPM_STATUS" -eq 0 ]; then
   ok "Dependencies installed"
+elif [ "$NPM_STATUS" -eq 124 ]; then
+  die "npm install exceeded 30 minutes and was stopped. Almost always a proxy or
+    registry problem. Check: npm config get registry / npm config get proxy,
+    and try 'npm ping'. Fix that, then re-run this script."
 else
-  die "npm install failed. Check your network/proxy, then re-run this script."
+  die "npm install failed (exit $NPM_STATUS). Scroll up for the npm error, then re-run."
 fi
 
-step "Installing headless Chromium for PDF/PPTX export"
-if ( cd "$TEMPLATE_DIR" && npx --no-install playwright install chromium >/dev/null 2>&1 ); then
+step "Checking the headless browser"
+info "Usually already present from the step above. Downloading it here if not (~150 MB)."
+set +e
+( cd "$TEMPLATE_DIR" && run_limited 900 npx --no-install playwright install chromium )
+PW_STATUS=$?
+set -e
+if [ "$PW_STATUS" -eq 0 ]; then
   ok "Chromium ready"
 else
-  warn "Could not pre-install Chromium. Exports will attempt to fetch it on first use."
-  warn "You can retry manually: cd <deck-dir> && npx playwright install chromium"
+  warn "Chromium not confirmed (exit $PW_STATUS). Exports may fetch it on first use."
+  warn "Retry manually: cd <deck-dir> && npx playwright install chromium"
 fi
 
 # ------------------------------------------------------------------- verify ----
 
 if [ "$SKIP_VERIFY" -eq 0 ]; then
   step "Verifying the toolchain with a real export"
-  if ( cd "$TEMPLATE_DIR" && npx --no-install slidev export --format png --output dist/_verify slides.md >/dev/null 2>&1 ); then
+  info "Launches Chromium and renders the starter deck. Up to a minute or two."
+  info "The first run also fetches webfonts named in the deck's headmatter."
+  VERIFY_LOG="$TEMPLATE_DIR/.verify.log"
+  set +e
+  ( cd "$TEMPLATE_DIR" && run_limited 420 npx --no-install slidev export \
+      --format png --output dist/_verify slides.md ) >"$VERIFY_LOG" 2>&1
+  VERIFY_STATUS=$?
+  set -e
+
+  if [ "$VERIFY_STATUS" -eq 0 ]; then
     VERIFY_COUNT=$(find "$TEMPLATE_DIR/dist/_verify" -name '*.png' 2>/dev/null | wc -l | tr -d ' ')
-    rm -rf "$TEMPLATE_DIR/dist"
+    rm -rf "$TEMPLATE_DIR/dist" "$VERIFY_LOG"
     ok "Rendered $VERIFY_COUNT slides successfully"
   else
-    warn "Smoke test failed. The skill is installed, but check exports manually:"
-    warn "  cd $TEMPLATE_DIR && npx slidev export --format png --output dist/test slides.md"
+    if [ "$VERIFY_STATUS" -eq 124 ]; then
+      warn "Render timed out after 7 minutes. Often a webfont fetch blocked by a firewall:"
+      warn "delete the 'fonts:' block from the deck's slides.md and try again."
+    else
+      warn "Smoke test failed (exit $VERIFY_STATUS). Last lines of the log:"
+      tail -n 15 "$VERIFY_LOG" 2>/dev/null | sed 's/^/      /'
+    fi
+    warn "The skill is installed regardless. Full log: $VERIFY_LOG"
   fi
 fi
 
